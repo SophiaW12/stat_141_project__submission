@@ -1,0 +1,806 @@
+---
+title: "Course Project"
+date: " "
+output: html_document
+---
+<style>
+ul {
+  list-style-type: square; /* Change bullet type */
+  color: blue; /* Change text color */
+  font-size: 18px; /* Increase font size */
+  margin-left: 20px; /* Adjust indentation */
+}
+
+ol {
+  list-style-type: upper-roman; /* Change numbering style */
+}
+</style>
+
+
+# Title
+Feedback Type Prediction Model
+
+
+# Abstract
+In this project, we are trying to use the data of left contrast, right contrast,spks, and brain area to predict the outcome of feedback type.
+
+
+# 1 :Introduction
+"Vision, decision-making, and actions arise from neuronal activity across multiple brain regions.The study conducted by Nicholas A. Steinmetz, Peter Zatka-Haas, Matteo Carandini & Kenneth D. Harris in 2019 mapped where these neurons are located in the brain. Researchers used Neuropixels probes to record from about 30,000 neurons across 42 brain regions in mice.The mice performed a visual discrimination task while neural activity was recorded. Neurons encoding visual stimuli and upcoming choices were found mainly in the neocortex, basal ganglia, and midbrain. Choice-related signals were rare and appeared at the same time across different regions.Midbrain neurons were active before contralateral choices and suppressed before ipsilateral choices, while forebrain neurons could prefer either side. Before a stimulus, brain-wide activity predicted engagement, with increased subcortical activity and reduced neocortical activity. These findings reveal how neurons are distributed in the brain to encode behaviorally relevant information."(summarized by chatgpt based on the nature article's abstract)
+
+"In the study conducted by Steinmetz et al. (2019), experiments were performed on a total of 10 mice over 39 sessions. Each session comprised several hundred trials, during which visual stimuli were randomly presented to the mouse on two screens positioned on both sides of it. The stimuli varied in terms of contrast levels, which took values in {0, 0.25, 0.5, 1}, with 0 indicating the absence of a stimulus. The mice were required to make decisions based on the visual stimuli, using a wheel controlled by their forepaws. A reward or penalty (i.e., feedback) was subsequently administered based on the outcome of their decisions. In particular,
+
+When left contrast > right contrast, success (1) if turning the wheel to the right and failure (-1) otherwise.
+When right contrast > left contrast, success (1) if turning the wheel to the left and failure (-1) otherwise.
+When both left and right contrasts are zero, success (1) if holding the wheel still and failure (-1) otherwise.
+When left and right contrasts are equal but non-zero, left or right will be randomly chosen (50%) as the correct choice.
+The activity of the neurons in the mice’s visual cortex was recorded during the trials and made available in the form of spike trains, which are collections of timestamps corresponding to neuron firing. In this project, we focus specifically on the spike trains of neurons from the onset of the stimuli to 0.4 seconds post-onset. In addition, we only use 18 sessions (Sessions 1 to 18) from four mice: Cori, Frossman, Hence, and Lederberg." 
+
+
+```{r}
+#install.packages("Matrix")
+#install.packages("ROCR")
+```
+
+
+```{r}
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(tidyverse)
+library(caret) 
+library(ROCR)
+```
+
+
+# 2 Exploratory analysis 
+
+-What are some interesting patterns of the data, especially the similarity and difference among different observations (trails). This will answer the question of how to select our training samples.
+-What patterns make a trail more likely to have a successful respinse. This will answer the question of how to build our training features.
+
+### summarizing the data
+```{r}
+sessions=list()
+for(i in 1:18){
+  sessions[[i]]=readRDS(paste('/Users/sophiawang/Desktop/stat141/sessions/session',i,'.rds',sep=''))
+}
+```
+
+
+```{r}
+
+summary_list <- lapply(1:18, function(i) {
+  df <- as.data.frame(summary(sessions[[i]]))
+  df <- cbind(Variable = rownames(df), df)  # Keep variable names
+  df$Sessions <- paste("Session", i)  # Add session ID
+  rownames(df) <- NULL  # Reset row names for clarity
+  return(df)
+})
+
+summary_list[[1]]
+summary_list[[5]]
+summary_list[[10]]
+summary_list[[18]]
+
+```
+
+### What's in a session?
+```{r}
+names(sessions[[1]])
+```
+feedback_type: Numerous instances indicate success, but potential issues may exist.
+contrast_left and contrast_right: Present in four distinct scenarios. In particular,
+When left contrast > right contrast, success (1) if turning the wheel to the right and failure (-1) otherwise.
+When right contrast > left contrast, success (1) if turning the wheel to the left and failure (-1) otherwise.
+When both left and right contrasts are zero, success (1) if holding the wheel still and failure (-1) otherwise.
+When left and right contrasts are equal but non-zero, left or right will be randomly chosen (50%) as the correct choice.
+mouse_name: Influenced by four factors.
+date_exp: May not be directly correlated with success.
+brain_area: Comprised of multiple factors; consideration for reduction to a smaller set of factors may be beneficial.
+spks: Matrix of dimensions 
+time: Vector of dimension q across sessions for number of trials Ni.
+
+### what's in a trail?
+```{r}
+dim(sessions[[1]]$spks[[1]]) 
+```
+```{r}
+length(sessions[[1]]$brain_area)
+```
+```{r}
+sessions[[1]]$spks[[1]][6,]
+```
+The first and second command show that the dimension of spks is 734 rows and 40 columns. which means there are 734 recorded neurons in 40 recorded time point.
+
+The third command extracts a specific trail, in this case the 6th row of spks matrix.The row consists 0s and 1s, indicating some neurons were actived and some are not. 
+
+
+### How to connect the neuron spike with brian region?
+
+```{r}
+sessions[[1]]$spks[[1]][6,3] 
+```
+
+```{r}
+sessions[[1]]$brain_area[6]
+```
+
+I denote the spike rate per neuron as the sum of spikes over the 40 time bins. The region_mean_spike records the average of spike rate over each region.
+```{r}
+
+get_trail_data <- function(session_id, trail_id){
+  spikes <- sessions[[session_id]]$spks[[trail_id]]
+  if (any(is.na(spikes))){
+    disp("value missing")
+  }
+
+  #trail_tibble <- as_tibble(spikes) %>% set_names(binename) %>%  add_column("brain_area" = session[[session_id]]$brain_area ) %>% group_by(brain_area) %>% summarize( "sum_spikes" =across(everything(),sum),.groups = "drop") 
+  trail_tibble <- tibble("neuron_spike" = rowSums(spikes))  %>%  add_column("brain_area" = sessions[[session_id]]$brain_area ) %>% group_by(brain_area) %>% summarize( region_sum_spike = sum(neuron_spike), region_count = n(),region_mean_spike = mean(neuron_spike)) 
+  trail_tibble  = trail_tibble%>% add_column("trail_id" = trail_id) %>% add_column("contrast_left"= sessions[[session_id]]$contrast_left[trail_id]) %>% add_column("contrast_right"= sessions[[session_id]]$contrast_right[trail_id]) %>% add_column("feedback_type"= sessions[[session_id]]$feedback_type[trail_id])
+  trail_tibble
+}
+```
+
+
+```{r}
+trail_tibble_1_2 <- get_trail_data(1,2)
+trail_tibble_1_2
+```
+
+###What are the number of neuron’s in each session?
+```{r}
+library(dplyr)
+
+# Create a tibble with session IDs and neuron counts
+neuron_counts <- tibble(
+  session_id = 1:length(sessions),  # Assign session numbers
+  region_count = sapply(sessions, function(session) length(session$brain_area))
+)
+
+# Print the table
+print(neuron_counts)
+```
+-there are 734 recorded reigions in session 1, 1070 recorded reigions in session 2, 619 recorded regions in session 3 and so on.
+
+###What is the number brain area of each session?
+```{r}
+library(dplyr)
+
+# Create a tibble with session IDs and brain area counts
+brain_area_counts <- tibble(
+  session_id = 1:length(sessions),  # Assign session numbers
+  brain_area_count = sapply(sessions, function(session) length(unique(session$brain_area)))
+)
+
+# Print the table
+print(brain_area_counts)
+```
+
+###What is the average spike rate over each session?
+```{r}
+library(dplyr)
+
+# Compute average spike rate for each session
+avg_spike_rates <- tibble(
+  session_id = 1:length(sessions),  # Assign session numbers
+  avg_spike_rate = sapply(sessions, function(session) {
+    mean(unlist(session$spks), na.rm = TRUE)  # Flatten and compute mean of spike rates
+  })
+)
+
+# Print the result
+print(avg_spike_rates)
+```
+
+
+###What are the brain areas with neurons recorded in each session?
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+# Create a data frame summarizing brain areas per session
+brain_area_data <- bind_rows(lapply(1:length(sessions), function(i) {
+  data.frame(
+    session_id = i, 
+    brain_area = unique(sessions[[i]]$brain_area)  # Extract unique brain areas per session
+  )
+}))
+
+# Plot brain areas recorded per session
+ggplot(brain_area_data, aes(x = session_id, y = brain_area)) +
+  geom_point(color = "black", size = 2) +  # Scatter plot of brain areas
+  theme_minimal() +
+  labs(title = "What are the brain areas with neurons recorded in each session?",
+       x = "Session ID",
+       y = "Brain Area") +
+  theme(plot.title = element_text(face = "bold", size = 16, hjust = 0.5),  # Bold and centered title
+        axis.text.x = element_text(size = 12), 
+        axis.text.y = element_text(size = 10))
+```
+-The vertical axis represents the names of the brain areas, the horizontal axis represents number of sessions.From this graph we can see the distribution of the brain areas across sessions. Each dot represents a brain area recorded in a specific session.
+
+-Variability of the brain areas--Some of the brain areas may appear multiple times in one session and may appears in  multiple sessions.
+
+-Diversity of the brain areas--Some sessions contain recorded more brain areas than others. 
+
+
+
+###Estimate success rate over different groups (session and mouse)
+
+```{r}
+success_rate_session <- bind_rows(lapply(1:length(sessions), function(i) {
+  data.frame(
+    session_id = i, 
+    success_rate = mean(sessions[[i]]$feedback_type == 1)  # Proportion of successful trials
+  )
+}))
+
+
+success_rate_mouse <- bind_rows(lapply(unique(sapply(sessions, function(x) x$mouse_name)), function(mouse) {
+  data.frame(
+    mouse_name = mouse, 
+    success_rate = mean(unlist(lapply(sessions, function(session) {
+      if (session$mouse_name == mouse) session$feedback_type == 1 else NA
+    })), na.rm = TRUE)  # Proportion of successful trials per mouse
+  )
+}))
+```
+
+```{r}
+ggplot(success_rate_mouse, aes(x = mouse_name, y = success_rate, fill = mouse_name)) +
+  geom_bar(stat = "identity", color = "black") +
+  theme_minimal() +
+  labs(title = "Success Rate by Mouse",
+       x = "Mouse Name",
+       y = "Success Rate") +
+  theme(plot.title = element_text(face = "bold", size = 16, hjust = 0.5))
+```
+-The graphs shows the proportion of different mouses' successful trials. we are able to tell that the success rates are ranged from roughly 0.6-0.7, this might suggests that some type of mice performs better than others.
+
+##What is different among each trail?
+###What is the contrast difference distribution?
+```{r}
+# Compute the contrast difference
+contrast_data <- bind_rows(lapply(sessions, function(session) {
+  data.frame(contrast_diff = abs(session$contrast_left - session$contrast_right))
+}))
+
+# Summarize the contrast difference distribution
+contrast_distribution <- contrast_data %>%
+  group_by(contrast_diff) %>%
+  summarise(n = n()) %>%
+  mutate(
+    perc = n / sum(n),  # Compute percentage
+    labels = paste0(round(perc * 100, 2), "%")  # Format percentage as a label
+  ) %>%
+  arrange(desc(n))  # Sort by frequency
+
+# Print the table
+print(contrast_distribution)
+
+```
+
+```{r}
+ggplot(contrast_distribution, aes(x = factor(contrast_diff), y = perc)) +
+  geom_bar(stat = "identity", fill = "steelblue", color = "black") +
+  geom_text(aes(label = labels), vjust = -0.5, size = 5) +  # Add percentage labels
+  theme_minimal() +
+  labs(title = "Contrast Difference Distribution",
+       x = "Contrast Difference",
+       y = "Proportion of Trials") +
+  theme(plot.title = element_text(face = "bold", size = 16, hjust = 0.5))
+
+```
+
+- what is contrast difference: "The contrast difference refers to the absolute difference between the contrast levels presented on two sides of a visual stimulus", in this case left contrast and right contrast. So that when contrast difference equals 0, both sides have the same contrast, meaning the decision making is randomly presented.
+
+-why it's important to look at: "A well-balanced experiment includes a mix of high, medium, and low contrast differences."
+
+-33.18% of the trials have zero contrast difference. 20.57% of the trails have moderate contrast differences. In total of 32.12%(17.56% + 14.56%) of the trails have higher contrast differences. 14.13%. of the trails have low contrast differences.
+Bease on these numbers we could tell this is a well-balanced experiment.
+
+###How does the contrast difference affect the success rate?
+```{r}
+# Compute contrast difference
+contrast_success_data <- bind_rows(lapply(sessions, function(session) {
+  data.frame(
+    contrast_diff = abs(session$contrast_left - session$contrast_right),
+    success = ifelse(session$feedback_type == 1, 1, 0)  # Convert feedback_type to binary success indicator
+  )
+}))
+
+# Compute success rate for each contrast difference
+contrast_success_summary <- contrast_success_data %>%
+  group_by(contrast_diff) %>%
+  summarise(success_rate = mean(success)) %>%
+  arrange(contrast_diff)  # Sort by contrast difference
+
+# Print the table
+print(contrast_success_summary)
+
+```
+```{r}
+# Load necessary library
+library(ggplot2)
+
+# Plot the success rate for each contrast difference
+ggplot(contrast_success_summary, aes(x = factor(contrast_diff), y = success_rate)) +
+  geom_bar(stat = "identity", fill = "steelblue", color = "black") +
+  geom_text(aes(label = round(success_rate, 2)), vjust = -0.5, size = 5) +  # Add success rate labels
+  theme_minimal() +
+  labs(title = "Success Rate by Contrast Difference",
+       x = "Contrast Difference",
+       y = "Success Rate") +
+  theme(plot.title = element_text(face = "bold", size = 16, hjust = 0.5))
+
+```
+-When contrast difference equals 0.00, the success rate is 62.87%. When contrast difference equals 0.50, the success rate is 77.70%. When contrast difference equals 1, the success rate is 79%. Based on the significant increases of success rate along with the increase in contrast difference, we can conclude that contrast difference strongly affects success rate.
+
+
+###Does the success rate difference among mice caused by the different distributions of contrast difference?
+
+```{r}
+# Compute contrast difference and success indicator for each mouse
+contrast_mouse_data <- bind_rows(lapply(sessions, function(session) {
+  data.frame(
+    mouse_name = session$mouse_name,  # Extract mouse name
+    contrast_diff = abs(session$contrast_left - session$contrast_right),  # Compute contrast difference
+    success = ifelse(session$feedback_type == 1, 1, 0)  # Convert feedback_type to binary success indicator
+  )
+}))
+
+# Compute success rate for each contrast difference and mouse
+contrast_mouse_summary <- contrast_mouse_data %>%
+  group_by(mouse_name, contrast_diff) %>%
+  summarise(success_rate = mean(success), .groups = "drop") %>%
+  pivot_wider(names_from = contrast_diff, values_from = success_rate)  # Reshape for a table format
+
+# Print the table
+print(contrast_mouse_summary)
+
+```
+
+
+```{r}
+ggplot(contrast_mouse_data, aes(x = contrast_diff, y = success, color = mouse_name)) +
+  stat_summary(fun = mean, geom = "line", size = 1.2) +
+  stat_summary(fun = mean, geom = "point", size = 3) +
+  theme_minimal() +
+  labs(title = "Success Rate per Contrast Difference for Each Mouse",
+       x = "Contrast Difference",
+       y = "Success Rate",
+       color = "Mouse Name") +
+  theme(plot.title = element_text(face = "bold", size = 16, hjust = 0.5))
+
+```
+
+
+```{r}
+# Create a data frame combining all session data
+success_rate_data <- bind_rows(lapply(seq_along(sessions), function(i) {
+  session <- sessions[[i]]
+  data.frame(
+    session_id = i,  # Store session number
+    trial_id = seq_along(session$feedback_type),  # Trial indices
+    success = ifelse(session$feedback_type == 1, 1, 0)  # Convert feedback to success indicator
+  )
+}))
+
+# Bin trials into groups of 25
+success_rate_data <- success_rate_data %>%
+  mutate(trial_group = ceiling(trial_id / 25)) %>%
+  group_by(session_id, trial_group) %>%
+  summarise(success_rate = mean(success), .groups = "drop")
+
+# View sample of processed data
+head(success_rate_data)
+
+```
+
+```{r}
+library(ggplot2)
+
+# Plot success rate over trial bins for each session
+ggplot(success_rate_data, aes(x = trial_group * 25, y = success_rate)) +
+  geom_bar(stat = "identity", fill = "black") +  # Bar plot
+  facet_wrap(~ session_id, scales = "free_x") +  # Facet by session
+  theme_minimal() +
+  labs(title = "Visualize Success Rate Change Over Time (Trial)",
+       subtitle = "The success rate is binned for each 25 trials.",
+       x = "Trial Group",
+       y = "Success Rate") +
+  theme(strip.text = element_text(face = "bold", size = 14),
+        plot.title = element_text(face = "bold", size = 18, hjust = 0.5),
+        plot.subtitle = element_text(size = 12, hjust = 0.5))
+
+```
+
+
+```{r}
+# Create a data frame combining all session data
+success_rate_mouse <- bind_rows(lapply(seq_along(sessions), function(i) {
+  session <- sessions[[i]]
+  data.frame(
+    mouse_name = session$mouse_name,  # Store mouse name
+    trial_id = seq_along(session$feedback_type),  # Trial indices
+    success = ifelse(session$feedback_type == 1, 1, 0)  # Convert feedback to success indicator
+  )
+}))
+
+# Bin trials into groups of 25
+success_rate_mouse <- success_rate_mouse %>%
+  mutate(trial_group = ceiling(trial_id / 25)) %>%
+  group_by(mouse_name, trial_group) %>%
+  summarise(success_rate = mean(success), .groups = "drop")
+
+# View sample of processed data
+head(success_rate_mouse)
+
+```
+
+
+```{r}
+library(ggplot2)
+
+# Plot success rate over trial bins for each mouse
+ggplot(success_rate_mouse, aes(x = trial_group * 25, y = success_rate)) +
+  geom_bar(stat = "identity", fill = "black") +  # Bar plot
+  facet_wrap(~ mouse_name, scales = "free_x") +  # Facet by mouse_name
+  theme_minimal() +
+  labs(title = "Visualize Success Rate Change Over Time (By Mouse)",
+       subtitle = "The success rate is binned for each 25 trials.",
+       x = "Trial Group",
+       y = "Success Rate") +
+  theme(strip.text = element_text(face = "bold", size = 14),
+        plot.title = element_text(face = "bold", size = 18, hjust = 0.5),
+        plot.subtitle = element_text(size = 12, hjust = 0.5))
+
+```
+
+
+```{r}
+# Create a data frame for spike rate analysis
+spike_rate_data <- bind_rows(lapply(seq_along(sessions), function(i) {
+  session <- sessions[[i]]
+  mean_spike_rate <- sapply(session$spks, function(trial_spikes) mean(rowSums(trial_spikes, na.rm = TRUE)))
+  
+  data.frame(
+    session_id = i,  # Add session number
+    trial_id = seq_along(mean_spike_rate),  # Trial indices
+    mean_spike = mean_spike_rate  # Mean spike per trial
+  )
+}))
+
+# View a sample of processed data
+head(spike_rate_data)
+
+```
+
+
+```{r}
+library(ggplot2)
+
+# Plot mean spike rate per trial for each session
+ggplot(spike_rate_data, aes(x = trial_id, y = mean_spike)) +
+  geom_line(color = "black") +  # Raw spike rate trends
+  geom_smooth(method = "loess", color = "blue") +  # Smoothed trendline
+  facet_wrap(~ session_id, scales = "free_x") +  # Facet by session
+  theme_minimal() +
+  labs(title = "Visualize the Change of Overall Neuron Spike Rate Over Time",
+       subtitle = "The average_spike is the number of spikes within each bin divided by total neurons per trial.",
+       x = "Trial ID",
+       y = "Mean Spike Rate") +
+  theme(strip.text = element_text(face = "bold", size = 14),
+        plot.title = element_text(face = "bold", size = 18, hjust = 0.5),
+        plot.subtitle = element_text(size = 12, hjust = 0.5))
+
+```
+
+###The change of overall neuron spike rate for each mouse
+
+```{r}
+# Create a data frame for spike rate analysis grouped by mouse
+spike_rate_mouse <- bind_rows(lapply(seq_along(sessions), function(i) {
+  session <- sessions[[i]]
+  mean_spike_rate <- sapply(session$spks, function(trial_spikes) mean(rowSums(trial_spikes, na.rm = TRUE)))
+
+  data.frame(
+    mouse_name = session$mouse_name,  # Mouse identifier
+    trial_id = seq_along(mean_spike_rate),  # Trial indices
+    mean_spike = mean_spike_rate  # Mean spike per trial
+  )
+}))
+
+# View a sample of processed data
+head(spike_rate_mouse)
+
+```
+
+
+```{r}
+library(ggplot2)
+
+# Plot mean spike rate per trial for each mouse
+ggplot(spike_rate_mouse, aes(x = trial_id, y = mean_spike)) +
+  geom_line(color = "black") +  # Raw spike rate trends
+  geom_smooth(method = "loess", color = "blue") +  # Smoothed trendline
+  facet_wrap(~ mouse_name, scales = "free_x") +  # Facet by mouse
+  theme_minimal() +
+  labs(title = "The Change of Overall Neuron Spike Rate for Each Mouse",
+       subtitle = "The average_spike is the number of spikes within each bin divided by total neurons per trial.",
+       x = "Trial ID",
+       y = "Mean Spike Rate") +
+  theme(strip.text = element_text(face = "bold", size = 14),
+        plot.title = element_text(face = "bold", size = 18, hjust = 0.5),
+        plot.subtitle = element_text(size = 12, hjust = 0.5))
+
+```
+
+
+# 3 Data integration
+
+```{r}
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(tidyverse)
+library(caret) 
+library(ROCR)
+```
+
+### summarizing the data
+```{r}
+sessions=list()
+for(i in 1:18){
+  sessions[[i]]=readRDS(paste('../sessions/session',i,'.rds',sep=''))
+}
+```
+
+```{r}
+summary_list <- lapply(1:18, function(i) {
+  df <- as.data.frame(summary(sessions[[i]]))
+  df <- cbind(Variable = rownames(df), df)  # Keep variable names
+  df$Sessions <- paste("Session", i)  # Add session ID
+  rownames(df) <- NULL  # Reset row names for clarity
+  return(df)
+})
+
+summary_list[[1]]
+```
+
+Extracting the data for contrast_left, contrast right, mouse_name, in each sessions, and name them as x data,  keeping separate lists for each session while saving them as a combined data frame.
+```{r}
+# Initialize an empty list to store extracted features
+x_feature_data <- list()
+
+# Loop through each session and extract the required features
+for (i in 1:18) {
+  session_data <- sessions[[i]]  # Get the current session data
+  
+  # Extract features
+  contrast_left <- session_data$contrast_left
+  contrast_right <- session_data$contrast_right
+  mouse_name <- rep(session_data$mouse_name, length(contrast_left))  # Repeat to match the length
+  
+  # Combine extracted features into a data frame
+  session_df <- data.frame(
+    contrast_left = contrast_left,
+    contrast_right = contrast_right,
+    mouse_name = mouse_name,
+    session = i  # Add session ID for tracking
+  )
+  
+  # Append to list
+  x_feature_data[[i]] <- session_df
+}
+
+# Combine all session data into a single data frame
+x_feature_data <- do.call(rbind, x_feature_data)
+
+# Print the first few rows of the integrated data
+head(x_feature_data)
+
+
+```
+
+Extracting the feedback type from all sessions, and combine them as y data.
+```{r}
+# Initialize an empty list to store feedback type
+y_label_data <- list()
+
+# Loop through each session and extract the feedback type
+for (i in 1:18) {
+  session_data <- sessions[[i]]  # Get the current session data
+  
+  # Extract feedback type
+  feedback_type <- session_data$feedback_type
+  
+  # Store feedback type in a data frame
+  y_label_data[[i]] <- data.frame(feedback_type = feedback_type, session = i)
+}
+
+# Combine all session data into a single data frame
+y_label_data <- do.call(rbind, y_label_data)
+
+# Print the first few rows of the integrated label data
+head(y_label_data)
+
+```
+
+Since there are many neurons in each data point, some brain area might add mulitple times. Thus for each datapoint, I want to compute the mean of all the spks in each brain_area, instead of sum them up.every time adding the spike data, add a count on the number of data used in this brain_area, and finally divide by that to compute the mean.
+```{r}
+
+# Step 1: Identify all unique brain areas across sessions
+all_brain_areas <- unique(unlist(lapply(1:18, function(i) unique(sessions[[i]]$brain_area))))
+N <- length(all_brain_areas)  # Total unique brain areas
+
+# Step 2: Process spikes feature
+spikes_feature_list <- list()
+
+for (i in 1:18) {
+  session_data <- sessions[[i]]
+  num_data_points <- length(session_data$contrast_left)  # Number of trials in session
+  num_neurons <- length(session_data$brain_area)  # Number of neurons in session
+  
+  # Initialize the spikes feature as a list of matrices (num_data_points, N, 40)
+  session_spikes <- vector("list", num_data_points)
+  session_counts <- matrix(0, nrow = num_data_points, ncol = N)  # Count occurrences per brain area
+  
+  for (j in 1:num_data_points) {
+    neuron_brain_areas <- session_data$brain_area  # Brain areas for this session
+    spikes_data <- session_data$spks[[j]]  # Spikes data (num_neurons, 40)
+    
+    # Initialize each entry as a (N, 40) matrix of zeros
+    session_spikes[[j]] <- matrix(0, nrow = N, ncol = 40)
+    
+    for (k in 1:num_neurons) {
+      brain_area_index <- which(all_brain_areas == neuron_brain_areas[k])  # Find brain area index
+      session_spikes[[j]][brain_area_index, ] <- session_spikes[[j]][brain_area_index, ] + spikes_data[k, ]
+      session_counts[j, brain_area_index] <- session_counts[j, brain_area_index] + 1
+    }
+  }
+  
+  # Compute the mean spikes per brain area (avoid division by zero)
+  for (j in 1:num_data_points) {
+    for (b in 1:N) {
+      if (session_counts[j, b] > 0) {
+        session_spikes[[j]][b, ] <- session_spikes[[j]][b, ] / session_counts[j, b]
+      }
+    }
+  }
+  
+  # Store in list
+  spikes_feature_list <- c(spikes_feature_list, session_spikes)
+}
+
+# Step 3: Integrate into x_feature_data without flattening
+x_feature_data$spikes <- spikes_feature_list  # Preserve list format to keep 3D structure
+
+# Print the structure of the updated spikes feature
+str(x_feature_data$spikes[[1]])  # Check an example data point
+
+
+
+
+```
+
+
+### Preparing data and Construct prediction model
+Now with finishing data integration and get all the x and y data to train.within x data, there are 4 variables, contrast_left and contrast_right are both just numbers, Mouse name is a character, it only has 4 types of mouse. And the spikes is a 2d data with shape (62, 40), representing spikes from 62 brain area, and each has 40 time steps. So I need to convert mouse name with some numerical value. And for spikes data, use pca for data dimension reduction. 
+```{r}
+
+library(caret)
+
+# Step 1: One-hot encode the mouse_name variable
+mouse_dummies <- model.matrix(~ mouse_name - 1, data = x_feature_data)
+
+# Step 2: Normalize contrast_left and contrast_right
+x_feature_data$contrast_left <- scale(x_feature_data$contrast_left)
+x_feature_data$contrast_right <- scale(x_feature_data$contrast_right)
+
+# Step 3: Apply PCA for spikes data dimension reduction
+spikes_matrix <- do.call(rbind, lapply(x_feature_data$spikes, as.vector))  # Ensure correct alignment
+pca_result <- prcomp(spikes_matrix, center = TRUE, scale. = TRUE)
+num_pca_components <- 10  # Choose number of PCA components
+spikes_pca <- pca_result$x[, 1:num_pca_components]  # Extract top principal components
+
+# Step 4: Normalize PCA-transformed spikes
+spikes_pca <- scale(spikes_pca)
+
+# Step 5: Ensure the correct number of observations in the final data frame
+processed_x_feature_data <- cbind(
+  contrast_left = x_feature_data$contrast_left,
+  contrast_right = x_feature_data$contrast_right,
+  mouse_dummies,
+  spikes_pca
+)
+
+# Convert back to a data frame
+processed_x_feature_data <- as.data.frame(processed_x_feature_data)
+
+# Print the dimensions to confirm correctness
+dim(processed_x_feature_data)
+head(processed_x_feature_data)
+
+
+```
+```{r}
+
+# Step 1: Remove session column from y_label_data
+y_label_data <- as.data.frame(y_label_data)  # Ensure it's a data frame
+y_label_data <- y_label_data[ , !(names(y_label_data) %in% c("session"))]
+```
+
+
+# 4 Predictive modeling
+### Train a logistic regrssion model
+```{r}
+library(caret)
+
+# Ensure y_label_data is a data frame and has correct column name
+y_label_data <- as.data.frame(y_label_data)
+names(y_label_data) <- "feedback_type"  # Ensure the column name is correct
+
+# Convert -1 labels to 0
+y_label_data$feedback_type <- ifelse(y_label_data$feedback_type == -1, 0, 1)
+
+# Set seed for reproducibility
+set.seed(42)
+
+# Shuffle data before splitting
+shuffle_index <- sample(1:nrow(processed_x_feature_data))
+processed_x_feature_data <- processed_x_feature_data[shuffle_index, ]
+y_label_data <- y_label_data[shuffle_index, , drop = FALSE]
+
+# Split the dataset (90% training, 10% testing)
+trainIndex <- createDataPartition(y_label_data$feedback_type, p = 0.9, list = FALSE)
+train_x <- processed_x_feature_data[trainIndex, ]
+train_y <- y_label_data$feedback_type[trainIndex]
+
+test_x <- processed_x_feature_data[-trainIndex, ]
+test_y <- y_label_data$feedback_type[-trainIndex]
+
+# Train logistic regression model
+logistic_model <- glm(train_y ~ ., data = data.frame(train_y, train_x), family = binomial)
+
+# Print model summary
+summary(logistic_model)
+
+# Make predictions on the test set
+test_pred <- predict(logistic_model, newdata = test_x, type = "response")
+test_pred_class <- ifelse(test_pred > 0.5, 1, 0)
+
+# Compute test accuracy
+test_accuracy <- mean(test_pred_class == test_y)
+print(paste("Test Accuracy:", round(test_accuracy * 100, 2), "%"))
+
+
+```
+
+
+# 6 Discussion
+-Summary:
+1.PC1 has a p value = 0.004172 and PC2 has a p value = 0.018784, with the values both smaller than 0.05, meaning they are statistically significant on predicting the outcome.
+2.This model uses mouse_name variables as predictors. The type of Mice significantly affects prediction since the p value for mouse_nameCori smaller than 0.0001 and mouse_nameHench also has p value smaller than 0.0001.
+3.The test Accuracy of the model is 67.91% with pca component number equals 10.It performs better than random guessing(50%).
+
+-Possible improvements:
+1.Some of the PC values are not significant. Removing them may improve the model.
+2.Maybe try with different pca components. 
+3.For mouse_nameLederberg I only NA values, I could probably also lookinto that.
+
+
+Acknowledgement
+
+link for chatgpt
+https://docs.google.com/document/d/1O7rUwbcYxUFlf3Ca_DRCAc72eIctseuH-evlfJ1Or5U/edit?usp=sharing
+
+
+
+
+
+
+
