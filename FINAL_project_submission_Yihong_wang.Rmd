@@ -18,7 +18,7 @@ ol {
 
 
 # Title
-Feedback Type Prediction Model
+Feedback Type Prediction Model - Yihong Wang
 
 
 # Abstract
